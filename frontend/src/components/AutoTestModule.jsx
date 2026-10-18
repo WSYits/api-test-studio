@@ -300,7 +300,7 @@ export default function AutoTestModule({ projects, apis, styles, onTaskCreated }
 
   const innerTabs = [
     { id: 'single', name: '单接口用例' },
-    { id: 'suite', name: '测试套件' },
+    // { id: 'suite', name: '测试套件' },
   ];
 
   return (
