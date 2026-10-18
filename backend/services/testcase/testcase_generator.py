@@ -28,14 +28,15 @@ class TestCaseGenerator:
         mixed_spaces: List[Dict[str, Any]],
         single_spaces: Dict[str, List[Dict[str, Any]]] | List[Dict[str, Any]],
         desired_count: int = 5,
+        case_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        生成测试用例 - 对半生成正向和异常输入
+        生成测试用例 - 按选定类型分配，不重复候选组合
         
         通过笛卡尔积方式：从每个混合空间中选一个子空间，组合起来生成一个测试用例
         特点：
         1. 将组合分为 valid 和 invalid 两类
-        2. 对半选择，保证正向和异常用例数量接近
+        2. 单选仅使用选定类型；双选均分，奇数时异常多一条
         3. 正向用例需要验证所有参数都来自 valid 类型的参数空间
         
         Args:
@@ -46,6 +47,7 @@ class TestCaseGenerator:
                          - 字典格式: {param_name: [{category_name, sample_value, description}, ...]}
                          - 数组格式: [{param_name: "...", valid: [...], invalid: [...]}, ...]
             desired_count: 期望生成的用例数量，默认5个
+            case_types: positive/negative 数组，省略时兼容双选
         
         Returns:
             测试用例列表
@@ -83,29 +85,30 @@ class TestCaseGenerator:
         
         print(f"\n📊 【用例分类统计】valid 组合: {len(valid_combinations)}, invalid 组合: {len(invalid_combinations)}")
         
-        # 对半选择：计算 valid 和 invalid 应各占多少
-        valid_target = desired_count // 2
-        invalid_target = desired_count - valid_target
-        
-        # 从两类中随机选择
+        selected_types = set(case_types if case_types is not None else ["positive", "negative"])
+        if not selected_types or not selected_types <= {"positive", "negative"}:
+            raise ValueError("case_types 必须包含 positive 或 negative")
+        if selected_types == {"positive", "negative"}:
+            valid_target = desired_count // 2
+            invalid_target = desired_count - valid_target
+        else:
+            valid_target = desired_count if "positive" in selected_types else 0
+            invalid_target = desired_count if "negative" in selected_types else 0
+
         selected_valid = random.sample(valid_combinations, min(len(valid_combinations), valid_target))
         selected_invalid = random.sample(invalid_combinations, min(len(invalid_combinations), invalid_target))
-        
-        # 如果某类数量不足，用另一类补充
-        if len(selected_valid) < valid_target and len(invalid_combinations) > len(selected_invalid):
-            need_more = valid_target - len(selected_valid)
-            more_invalid = [c for c in invalid_combinations if c not in selected_invalid]
-            selected_valid.extend(random.sample(more_invalid, min(len(more_invalid), need_more)))
-        
-        if len(selected_invalid) < invalid_target and len(valid_combinations) > len(selected_valid):
-            need_more = invalid_target - len(selected_invalid)
-            more_valid = [c for c in valid_combinations if c not in selected_valid]
-            selected_invalid.extend(random.sample(more_valid, min(len(more_valid), need_more)))
-        
+        # 仅从已选类型的剩余候选中补足，保持两个分类列表准确。
+        for candidates, selected, case_type in (
+            (valid_combinations, selected_valid, "positive"),
+            (invalid_combinations, selected_invalid, "negative"),
+        ):
+            remaining_count = desired_count - len(selected_valid) - len(selected_invalid)
+            if remaining_count > 0 and case_type in selected_types:
+                remaining = [c for c in candidates if c not in selected]
+                selected.extend(random.sample(remaining, min(len(remaining), remaining_count)))
+
         selected_combinations = selected_valid + selected_invalid
-        
-        print(f"📋 【最终选择】valid 用例: {len(selected_valid)}, invalid 用例: {len(selected_invalid)}")
-        
+
         # 每个组合生成一个测试用例
         for combo_idx, subspace_combo in enumerate(selected_combinations):
             # subspace_combo 是一个列表：[(space, subspace), (space, subspace), ...]
@@ -195,8 +198,8 @@ class TestCaseGenerator:
         # 收集所有参数
         all_parameter_list = list(merged_single_param_spaces_mapping.keys())
         
-        # 判断用例类型：如果包含任何invalid子空间，则为异常输入，否则为正向用例
-        case_type = "异常输入" if "invalid" in subspace_types else "正向用例"
+        # 与候选筛选一致：所有子空间均为 valid 才是正向用例
+        case_type = "正向用例" if all(st == "valid" for st in subspace_types) else "异常输入"
         must_be_valid = case_type == "正向用例"  # 正向用例需要验证参数都是valid
         
         print(f"\n🔍 【生成测试用例调试信息】API ID: {api_id}, Combo #{combo_idx}, 类型: {case_type}")

@@ -607,7 +607,7 @@ export default function AutoTestModule({ projects, apis, styles, onTaskCreated }
                             const testCaseResponse = await fetch(`http://localhost:8080/projects/${selectedProject}/apis/${selectedApi.id}/generate-test-cases`, {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ count: generateCount }),
+                              body: JSON.stringify({ count: generateCount, case_types: selectedCaseTypes }),
                             });
 
                             if (!testCaseResponse.ok) {
@@ -625,6 +625,9 @@ export default function AutoTestModule({ projects, apis, styles, onTaskCreated }
                               return;
                             }
 
+                            if (testCasesResult.actual_count < testCasesResult.requested_count) {
+                              alert(testCasesResult.message);
+                            }
                             console.log('✅ 第2步完成：测试用例生成成功', testCasesResult);
                             updateGenerationStep('testcase_gen', 'completed');
 

@@ -1336,7 +1336,7 @@ async def generate_full_partition_pipeline(
 async def generate_test_cases_endpoint(
     project_id: int,
     api_id: int,
-    request_body: dict = Body(default={"count": 5}),
+    request_body: dict = Body(...),
     db: Session = Depends(get_db),
 ):
     """
@@ -1350,8 +1350,14 @@ async def generate_test_cases_endpoint(
     """
     try:
         # 获取请求体中的参数
-        desired_count = request_body.get("count", 5) if request_body else 5
-        desired_count = int(desired_count)
+        desired_count = request_body.get("count")
+        if type(desired_count) is not int or not 1 <= desired_count <= 50:
+            raise HTTPException(status_code=400, detail="count 必须为 1-50 的整数，不接受布尔值、小数、字符串或空值")
+        case_types = request_body.get("case_types", ["positive", "negative"])
+        if (not isinstance(case_types, list) or not case_types
+                or any(not isinstance(t, str) or t not in ("positive", "negative") for t in case_types)):
+            raise HTTPException(status_code=400, detail="case_types 必须为非空数组，且只能包含 positive、negative")
+        case_types = list(dict.fromkeys(case_types))
         
         # 获取 API
         api = db.query(Api).filter(Api.id == api_id, Api.project_id == project_id).first()
@@ -1412,7 +1418,11 @@ async def generate_test_cases_endpoint(
             mixed_spaces=mixed_spaces,
             single_spaces=single_spaces,
             desired_count=desired_count,
+            case_types=case_types,
         )
+
+        if not test_cases:
+            raise HTTPException(status_code=400, detail="所选类型没有可生成的候选组合，原用例和采纳记录已保留")
 
         # 生成后直接落库，保证前端刷新后可见
         db.query(TestCase).filter(TestCase.api_id == api_id).delete()
@@ -1447,14 +1457,23 @@ async def generate_test_cases_endpoint(
         return {
             "status": "success",
             "api_id": api_id,
-            "message": f"Generated and saved {len(test_cases)} test cases successfully",
+            "message": (f"所选类型候选组合不足：请求 {desired_count} 条，实际生成 {len(test_cases)} 条"
+                        if len(test_cases) < desired_count else f"成功生成 {len(test_cases)} 条用例"),
+            "requested_count": desired_count,
+            "actual_count": len(test_cases),
+            "case_types": case_types,
             "count": len(test_cases),
             "test_cases": test_cases,
         }
     
+    except HTTPException:
+        db.rollback()
+        raise
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=f"Invalid data: {str(e)}")
     except Exception as e:
+        db.rollback()
         import traceback
         error_detail = traceback.format_exc()
         print(f"❌ 测试用例生成失败: {str(e)}\n{error_detail}")
