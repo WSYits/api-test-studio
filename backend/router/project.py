@@ -1,10 +1,14 @@
 from fastapi import APIRouter, HTTPException, UploadFile, Form, Depends, Body, BackgroundTasks
+from sqlalchemy import select, union_all, literal
 from sqlalchemy.orm import Session
+from types import SimpleNamespace
+from copy import deepcopy
 from database import SessionLocal, Project, Api, ApiRequestBody, SingleInputSpace, MultiInputSpace, MixedInputSpace, AdoptedTestCase, TestCase, TestRunTask, TestRunResult
 from services.openapi_parser import parse_openapi, extract_apis_from_openapi, extract_project_info
 from services.ai_constraint_extractor import get_extractor
 from services.partition import generate_single_parameter_partition, generate_multi_parameter_partition, generate_mixed_parameter_partition
 import json
+import hashlib
 import requests
 import time
 from datetime import datetime
@@ -1098,234 +1102,265 @@ async def generate_mixed_partition_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to generate mixed partition: {str(e)}")
 
 
+def _partition_inputs(db, api, request_body):
+    # 读取 API 已保存的单参数约束
+    all_single_constraints = api.single_constraints or {}
+
+    if isinstance(all_single_constraints, str):
+        all_single_constraints = json.loads(all_single_constraints)
+
+    if not isinstance(all_single_constraints, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="单参数约束数据格式错误"
+        )
+
+    # 读取 API 已保存的多参数依赖
+    all_dependencies = api.dependencies or []
+
+    if isinstance(all_dependencies, str):
+        all_dependencies = json.loads(all_dependencies)
+
+    if all_dependencies == {}:
+        all_dependencies = []
+
+    if not isinstance(all_dependencies, list):
+        raise HTTPException(
+            status_code=400,
+            detail="多参数依赖数据格式错误"
+        )
+
+    # 构建当前 API 所有合法的约束 ID
+    available_ids = {
+        f"single_{name}"
+        for name in all_single_constraints
+    }
+
+    available_ids.update({
+        f"dep_{index}"
+        for index in range(len(all_dependencies))
+    })
+
+    # 读取本次用户选择
+    payload = request_body or {}
+
+    if "selected_constraints" not in payload:
+        # 兼容旧请求：默认使用全部约束
+        selected_ids = available_ids
+    else:
+        requested_ids = payload["selected_constraints"]
+
+        if (
+            not isinstance(requested_ids, list)
+            or any(not isinstance(item, str) for item in requested_ids)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="selected_constraints 必须是字符串数组"
+            )
+
+        selected_ids = set(requested_ids)
+
+        # 拒绝不存在的约束 ID
+        unknown_ids = selected_ids - available_ids
+
+        if unknown_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知的约束 ID: {sorted(unknown_ids)}"
+            )
+
+    # 筛选单参数约束
+    selected_single_constraints = {
+        name: constraint
+        for name, constraint in all_single_constraints.items()
+        if f"single_{name}" in selected_ids
+    }
+
+    # 筛选多参数依赖
+    selected_dependencies = [
+        dependency
+        for index, dependency in enumerate(all_dependencies)
+        if f"dep_{index}" in selected_ids
+    ]
+
+    swagger_doc = json.loads(api.swagger_doc) if isinstance(api.swagger_doc, str) else api.swagger_doc
+    if not isinstance(swagger_doc, dict) or not swagger_doc:
+        raise HTTPException(status_code=400, detail="API Swagger document is empty or invalid")
+    bodies = db.query(ApiRequestBody).filter(ApiRequestBody.api_id == api.id).order_by(ApiRequestBody.id).all()
+    parameters = {"query": api.query_params or [], "path": api.path_params or [],
+                  "headers": api.headers_params or [], "body": []}
+    body_metadata = []
+    for body in bodies:
+        parameters["body"].extend(body.body_params if isinstance(body.body_params, list) else [])
+        body_metadata.append({"media_type": body.media_type, "is_default": body.is_default,
+                              "body_params": body.body_params})
+    snapshot = {"version": 1, "api_id": api.id, "method": api.method, "url": api.url,
+                "swagger_doc": swagger_doc, "parameters": parameters, "request_bodies": body_metadata,
+                "selected_ids": sorted(selected_ids), "single_constraints": selected_single_constraints,
+                "dependencies": selected_dependencies}
+    fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False,
+                                            separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    return fingerprint, swagger_doc, parameters, selected_single_constraints, selected_dependencies
+
+
+def _partition_records(db, api_id):
+    return [db.query(model).filter(model.api_id == api_id).order_by(model.id).all()
+            for model in (SingleInputSpace, MultiInputSpace, MixedInputSpace)]
+
+
+def _partition_snapshot(db, api_id):
+    # One SQLite statement has one consistent read view, including in legacy
+    # sqlite3 transaction mode. Column reads also bypass the ORM identity map.
+    models = (SingleInputSpace, MultiInputSpace, MixedInputSpace)
+    statement = union_all(*[
+        select(literal(index).label("kind"), model.spaces, model.input_fingerprint)
+        .where(model.api_id == api_id) for index, model in enumerate(models)
+    ])
+    records = [[], [], []]
+    for kind, spaces, fingerprint in db.execute(statement):
+        records[kind].append(SimpleNamespace(spaces=deepcopy(spaces), input_fingerprint=fingerprint))
+    return records
+
+
+def _valid_partition_spaces(spaces, single=False, mixed=False):
+    def name(value):
+        return isinstance(value, str) and bool(value.strip())
+
+    def category(value, typed=False):
+        return (isinstance(value, dict) and name(value.get("category_name"))
+                and (not typed or value.get("type") in ("valid", "invalid"))
+                and ("type" not in value or value["type"] in ("valid", "invalid"))
+                and (typed or bool(value.get("sample_values")) or "sample_value" in value
+                     or bool(value.get("description")))
+                and ("description" not in value or isinstance(value["description"], str))
+                and ("sample_values" not in value or isinstance(value["sample_values"], list)))
+
+    def categories(values, typed=False):
+        return isinstance(values, list) and bool(values) and all(category(v, typed) for v in values)
+
+    if single:
+        if isinstance(spaces, dict):
+            return bool(spaces) and all(name(k) and categories(v) for k, v in spaces.items())
+        if not isinstance(spaces, list) or not spaces:
+            return False
+        names = []
+        for group in spaces:
+            if not isinstance(group, dict) or not name(group.get("param_name")):
+                return False
+            names.append(group["param_name"])
+            if any(not isinstance(group.get(kind), list) for kind in ("valid", "invalid")):
+                return False
+            values = group["valid"] + group["invalid"]
+            if not categories(values):
+                return False
+        return len(names) == len(set(names))
+    if not isinstance(spaces, list) or not spaces:
+        return False
+    for space in spaces:
+        if not isinstance(space, dict) or not isinstance(space.get("subspaces"), list) or not space["subspaces"]:
+            return False
+        for item in [space] + space["subspaces"]:
+            if not isinstance(item, dict):
+                return False
+            if "parameter_list" in item and (not isinstance(item["parameter_list"], list)
+                    or not all(name(v) for v in item["parameter_list"])):
+                return False
+        for sub in space["subspaces"]:
+            if sub.get("type") not in ("valid", "invalid") or not isinstance(sub.get("description"), str):
+                return False
+            mapping = sub.get("single_parameter_spaces", {})
+            if (mixed and "single_parameter_spaces" not in sub) or not isinstance(mapping, dict):
+                return False
+            if not all(name(k) and categories(v, typed=True) for k, v in mapping.items()):
+                return False
+            if mixed and not set(sub.get("parameter_list", [])).issubset(mapping):
+                return False
+    return True
+
+
+def _partition_cache_valid(records, fingerprint):
+    return all(len(rows) == 1 and rows[0].input_fingerprint == fingerprint
+               and _valid_partition_spaces(rows[0].spaces, single=index == 0, mixed=index == 2)
+               for index, rows in enumerate(records))
+
+
 @router.post("/projects/{project_id}/apis/{api_id}/generate-full-partition")
 async def generate_full_partition_pipeline(
     project_id: int,
     api_id: int,
+    request_body: dict | None = Body(default=None),
     db: Session = Depends(get_db),
 ):
-    """
-    完整的输入空间生成流程：单参数空间 -> 多参数空间 -> 混合空间
-    并将结果保存到SISP和MISP表
-    支持缓存：如果数据库中已有SISP或MISP记录，则直接读取，不重新生成
-    """
+    """Reuse a complete matching snapshot, or atomically replace all three spaces."""
     try:
-        # 获取 API
         api = db.query(Api).filter(Api.id == api_id, Api.project_id == project_id).first()
         if not api:
             raise HTTPException(status_code=404, detail="API not found")
-        
-        timestamp = datetime.now().isoformat()
-        
-        # ============ 检查SISP缓存 ============
-        existing_sisp = db.query(SingleInputSpace).filter(SingleInputSpace.api_id == api_id).first()
-        if existing_sisp:
-            single_spaces = existing_sisp.spaces
-            print(f"✅ 从SISP缓存读取单参数空间，API ID: {api_id}")
+        fingerprint, swagger_doc, parameters, constraints, dependencies = _partition_inputs(db, api, request_body)
+        records = _partition_snapshot(db, api_id)
+        from_cache = _partition_cache_valid(records, fingerprint)
+        if from_cache:
+            single_spaces, multi_spaces_before, multi_spaces_after = [rows[0].spaces for rows in records]
         else:
-            # 需要生成SISP
-            # 收集参数
-            parameters = {
-                "query": api.query_params or [],
-                "path": api.path_params or [],
-                "headers": api.headers_params or [],
-                "body": []
-            }
-            
-            # 从 ApiRequestBody 获取 body 参数
-            request_bodies = db.query(ApiRequestBody).filter(ApiRequestBody.api_id == api_id).all()
-            if request_bodies:
-                for rb in request_bodies:
-                    body_params = rb.body_params if isinstance(rb.body_params, list) else []
-                    parameters["body"].extend(body_params if isinstance(body_params, list) else [])
-            
-            # 获取单参数约束
-            single_constraints = {}
-            if api.single_constraints:
-                single_constraints = api.single_constraints if isinstance(api.single_constraints, dict) else json.loads(api.single_constraints)
-            
-            # 构建 swagger_operation
-            swagger_doc = json.loads(api.swagger_doc) if isinstance(api.swagger_doc, str) else api.swagger_doc
-            if not swagger_doc:
-                raise HTTPException(status_code=400, detail="API Swagger document is empty")
-            
-            swagger_operation = {
-                "summary": swagger_doc.get("summary", ""),
-                "description": swagger_doc.get("description", ""),
-                "parameters": swagger_doc.get("parameters", []),
-                "requestBody": swagger_doc.get("requestBody", {}),
-                "responses": swagger_doc.get("responses", {}),
-            }
-            
-            # ============ 生成单参数空间 ============
+            # Keep generated values in memory; no cache writes until every stage succeeds.
             single_spaces = generate_single_parameter_partition(
-                api_id=api_id,
-                swagger_operation=swagger_operation,
-                parameters=parameters,
-                single_constraints=single_constraints,
-            )
-            
-            # 保存到SISP表
-            new_sisp = SingleInputSpace(
-                api_id=api_id,
-                spaces=single_spaces,
-                created_at=timestamp,
-                updated_at=timestamp
-            )
-            db.add(new_sisp)
-            db.commit()
-            print(f"✅ 生成并保存SISP，API ID: {api_id}")
-        
-        # ============ 检查MISP缓存 ============
-        existing_misp = db.query(MultiInputSpace).filter(MultiInputSpace.api_id == api_id).first()
-        existing_mixed = db.query(MixedInputSpace).filter(MixedInputSpace.api_id == api_id).first()
-        if existing_misp and existing_mixed:
-            # 从缓存读取MISP和MixedInputSpace
-            multi_spaces_before = existing_misp.spaces
-            multi_spaces_after = existing_mixed.spaces
-            print(f"✅ 从缓存读取多参数空间和混合空间，API ID: {api_id}")
-        else:
-            # 需要生成MISP
-            # 收集参数（如果SISP已从缓存读取，参数可能为空，需要重新收集）
-            parameters = {
-                "query": api.query_params or [],
-                "path": api.path_params or [],
-                "headers": api.headers_params or [],
-                "body": []
-            }
-            
-            # 从 ApiRequestBody 获取 body 参数
-            request_bodies = db.query(ApiRequestBody).filter(ApiRequestBody.api_id == api_id).all()
-            if request_bodies:
-                for rb in request_bodies:
-                    body_params = rb.body_params if isinstance(rb.body_params, list) else []
-                    parameters["body"].extend(body_params if isinstance(body_params, list) else [])
-            
-            # 获取参数间依赖关系
-            dependencies = []
-            if api.dependencies:
-                dependencies = api.dependencies if isinstance(api.dependencies, list) else json.loads(api.dependencies)
-            
-            # ============ 生成多参数空间 ============
-            multi_spaces_before_result = generate_multi_parameter_partition(
-                api_id=api_id,
-                parameters=parameters,
-                dependencies=dependencies,
-                single_partitions=single_spaces,
-            )
-            # 注意: 返回值中的字段是 "spaces" 不是 "multi_parameter_spaces"
-            multi_spaces_before = multi_spaces_before_result.get("spaces", [])
-            
-            # 验证多参数空间是否成功生成
-            if not multi_spaces_before or len(multi_spaces_before) == 0:
-                print(f"⚠️  多参数空间生成为空，API ID: {api_id}")
-                print(f"   多参数空间生成结果: {multi_spaces_before_result}")
-            else:
-                print(f"✅ 多参数空间生成成功，API ID: {api_id}，数量: {len(multi_spaces_before)}")
-            
-            # ============ 生成混合空间 ============
-            # 将单参数空间转换为混合生成器期望的格式
-            single_parameter_spaces_dict = {}
+                api_id=api_id, swagger_operation={key: swagger_doc.get(key, default) for key, default in
+                    (("summary", ""), ("description", ""), ("parameters", []), ("requestBody", {}), ("responses", {}))},
+                parameters=parameters, single_constraints=constraints)
+            if not _valid_partition_spaces(single_spaces, single=True):
+                raise ValueError("单参数空间生成失败或为空")
+            multi_result = generate_multi_parameter_partition(
+                api_id=api_id, parameters=parameters, dependencies=dependencies, single_partitions=single_spaces)
+            multi_spaces_before = multi_result.get("spaces") if isinstance(multi_result, dict) else None
+            if not _valid_partition_spaces(multi_spaces_before):
+                raise ValueError("多参数空间生成失败或为空")
+            single_mapping = single_spaces
             if isinstance(single_spaces, list):
-                for param_group in single_spaces:
-                    param_name = param_group.get("param_name")
-                    if param_name:
-                        categories = []
-                        
-                        # 添加有效分类
-                        for valid_cat in param_group.get("valid", []):
-                            categories.append({
-                                "category_name": valid_cat.get("category_name", "有效分类"),
-                                "description": valid_cat.get("description", ""),
-                                "type": "valid"
-                            })
-                        
-                        # 添加无效分类
-                        for invalid_cat in param_group.get("invalid", []):
-                            categories.append({
-                                "category_name": invalid_cat.get("category_name", "无效分类"),
-                                "description": invalid_cat.get("description", ""),
-                                "type": "invalid"
-                            })
-                        
-                        single_parameter_spaces_dict[param_name] = categories
-            elif isinstance(single_spaces, dict):
-                single_parameter_spaces_dict = single_spaces
-            
-            print(f"🔄 准备生成混合空间...")
-            print(f"   多参数空间数量: {len(multi_spaces_before)}")
-            print(f"   单参数空间参数数: {len(single_parameter_spaces_dict)}")
-            
-            mixed_spaces_result = generate_mixed_parameter_partition(
-                api_id=api_id,
-                multi_parameter_spaces=multi_spaces_before,
-                single_parameter_spaces=single_parameter_spaces_dict,
-            )
-            multi_spaces_after = mixed_spaces_result.get("multi_parameter_spaces", [])
-            
-            print(f"✅ 混合空间生成完成，数量: {len(multi_spaces_after)}")
-            
-            # 验证混合空间是否生成成功
-            if not multi_spaces_after or len(multi_spaces_after) == 0:
-                print(f"⚠️  混合空间生成为空，API ID: {api_id}，取消保存")
-                raise ValueError(f"混合空间生成失败或为空: {mixed_spaces_result}")
-            
-            # 只有在两个都成功生成时才保存到两张表
-            if len(multi_spaces_before) > 0 and len(multi_spaces_after) > 0:
-                # 删除旧的记录（如果存在）
-                db.query(MultiInputSpace).filter(MultiInputSpace.api_id == api_id).delete()
-                db.query(MixedInputSpace).filter(MixedInputSpace.api_id == api_id).delete()
-                
-                # 保存到MultiInputSpace表（多参数空间）
-                new_misp = MultiInputSpace(
-                    api_id=api_id,
-                    spaces=multi_spaces_before,
-                    created_at=timestamp,
-                    updated_at=timestamp
-                )
-                db.add(new_misp)
-                
-                # 保存到MixedInputSpace表（混合空间）
-                new_mixed = MixedInputSpace(
-                    api_id=api_id,
-                    spaces=multi_spaces_after,
-                    created_at=timestamp,
-                    updated_at=timestamp
-                )
-                db.add(new_mixed)
-                db.commit()
-                print(f"✅ 生成并保存MISP和MixedInputSpace，API ID: {api_id}")
-            else:
-                print(f"❌ 数据有问题，不保存: 混合前={len(multi_spaces_before)}, 混合后={len(multi_spaces_after)}")
-                raise ValueError(f"多参数空间数据无效: 混合前数量={len(multi_spaces_before)}, 混合后数量={len(multi_spaces_after)}")
-        
-        # ============ 返回结果 ============
-        # 准备返回数据
-        single_spaces_count = len(single_spaces) if isinstance(single_spaces, list) else len(single_spaces) if isinstance(single_spaces, dict) else 0
-        
+                single_mapping = {}
+                for group in single_spaces:
+                    if group.get("param_name"):
+                        single_mapping[group["param_name"]] = [
+                            {"category_name": cat.get("category_name", "有效分类" if kind == "valid" else "无效分类"),
+                             "description": cat.get("description", ""), "type": kind}
+                            for kind in ("valid", "invalid") for cat in group.get(kind, [])]
+            mixed_result = generate_mixed_parameter_partition(
+                api_id=api_id, multi_parameter_spaces=multi_spaces_before, single_parameter_spaces=single_mapping)
+            multi_spaces_after = mixed_result.get("multi_parameter_spaces") if isinstance(mixed_result, dict) else None
+            if not _valid_partition_spaces(multi_spaces_after, mixed=True):
+                raise ValueError("混合空间生成失败或为空")
+            # End the read transaction and recheck persisted inputs after slow generation.
+            db.rollback()
+            db.expire_all()
+            current_api = db.query(Api).filter(Api.id == api_id, Api.project_id == project_id).first()
+            if current_api is None or _partition_inputs(db, current_api, request_body)[0] != fingerprint:
+                raise HTTPException(status_code=409, detail="生成期间 API 输入已变化，请重试；原缓存已保留")
+            records = _partition_records(db, api_id)
+            timestamp = datetime.now().isoformat()
+            # Update the first row and remove only redundant cache rows in one transaction.
+            for model, rows, spaces in zip((SingleInputSpace, MultiInputSpace, MixedInputSpace), records,
+                                           (single_spaces, multi_spaces_before, multi_spaces_after)):
+                record = rows[0] if rows else model(api_id=api_id, created_at=timestamp)
+                for duplicate in rows[1:]:
+                    db.delete(duplicate)
+                record.spaces = spaces
+                record.input_fingerprint = fingerprint
+                record.updated_at = timestamp
+                db.add(record)
+            db.commit()
         return {
-            "status": "success",
-            "message": f"succeeded (from cache: {bool(existing_misp)})" if existing_misp else "Generated successfully",
-            "api_id": api_id,
-            "from_cache": {
-                "sisp": bool(existing_sisp),
-                "misp": bool(existing_misp)
-            },
-            "single_spaces": {
-                "count": single_spaces_count,
-                "parameters": list(single_spaces.keys()) if isinstance(single_spaces, dict) else [s.get("param_name") for s in (single_spaces if isinstance(single_spaces, list) else [])]
-            },
-            "multi_spaces_before": {
-                "count": len(multi_spaces_before),
-                "spaces": multi_spaces_before[:2] if multi_spaces_before else []  # 返回前2个作为示例
-            },
-            "multi_spaces_after": {
-                "count": len(multi_spaces_after),
-                "spaces": multi_spaces_after[:2] if multi_spaces_after else []  # 返回前2个作为示例
-            }
-        }
-    
+            "status": "success", "message": "Reused matching cache" if from_cache else "Generated successfully",
+            "api_id": api_id, "input_fingerprint": fingerprint,
+            "from_cache": {"sisp": from_cache, "misp": from_cache, "mixed": from_cache},
+            "single_spaces": {"count": len(single_spaces), "parameters": list(single_spaces) if isinstance(single_spaces, dict)
+                              else [s.get("param_name") for s in single_spaces]},
+            "multi_spaces_before": {"count": len(multi_spaces_before), "spaces": multi_spaces_before[:2]},
+            "multi_spaces_after": {"count": len(multi_spaces_after), "spaces": multi_spaces_after[:2]}}
+    except HTTPException:
+        db.rollback()
+        raise
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=f"Invalid data: {str(e)}")
     except Exception as e:
         db.rollback()
@@ -1364,20 +1399,24 @@ async def generate_test_cases_endpoint(
         if not api:
             raise HTTPException(status_code=404, detail="API not found")
         
-        # 获取混合空间（缓存）
-        mixed_space_record = db.query(MixedInputSpace).filter(MixedInputSpace.api_id == api_id).first()
-        if not mixed_space_record:
-            raise HTTPException(status_code=400, detail="No mixed space found. Please generate partition first.")
-        
-        mixed_spaces = mixed_space_record.spaces  # 这是一个列表
-        
-        # 获取单参数空间（缓存）
-        single_space_record = db.query(SingleInputSpace).filter(SingleInputSpace.api_id == api_id).first()
-        if not single_space_record:
-            raise HTTPException(status_code=400, detail="No single parameter space found. Please generate partition first.")
-        
-        single_spaces = single_space_record.spaces  # 这可能是字典或列表
-        
+        # Legacy count-only callers mean "all constraints" and must also use valid caches.
+        current, *_ = _partition_inputs(db, api, request_body)
+        explicit_snapshot = "input_fingerprint" in request_body or "selected_constraints" in request_body
+        if explicit_snapshot:
+            expected = request_body.get("input_fingerprint")
+            if not isinstance(expected, str) or not expected:
+                raise HTTPException(status_code=400, detail="缺少输入指纹，请重新生成输入空间")
+            if expected != current:
+                raise HTTPException(status_code=409, detail="输入空间与本次约束选择不一致，请重新生成输入空间")
+        records = _partition_snapshot(db, api_id)
+        if not _partition_cache_valid(records, current):
+            raise HTTPException(status_code=409 if explicit_snapshot else 400,
+                                detail="输入空间不完整、已过期或与本次约束选择不一致，请重新生成输入空间")
+
+        # Use precisely the detached values whose fingerprints were validated.
+        single_spaces = records[0][0].spaces
+        mixed_spaces = records[2][0].spaces
+
         # 【调试】打印 single_spaces 的详细结构
         print(f"\n📊 【single_spaces 详细结构调试】")
         print(f"  Type: {type(single_spaces)}")

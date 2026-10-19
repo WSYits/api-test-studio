@@ -83,6 +83,8 @@ class SingleInputSpace(Base):
     # 单参数空间的完整结构：{param_name: [categories...]}
     spaces = Column(JSON, nullable=False, comment="Single parameter input spaces")
     
+    input_fingerprint = Column(String, nullable=True)
+
     created_at = Column(String, nullable=True, comment="Creation timestamp")
     updated_at = Column(String, nullable=True, comment="Last update timestamp")
 
@@ -97,6 +99,8 @@ class MultiInputSpace(Base):
     # 多参数空间 - 混合前
     spaces = Column(JSON, nullable=False, comment="Multi-parameter spaces before mixing")
     
+    input_fingerprint = Column(String, nullable=True)
+
     created_at = Column(String, nullable=True, comment="Creation timestamp")
     updated_at = Column(String, nullable=True, comment="Last update timestamp")
 
@@ -111,6 +115,8 @@ class MixedInputSpace(Base):
     # 混合空间 - 混合后（关联单参数空间分类）
     spaces = Column(JSON, nullable=False, comment="Mixed multi-parameter spaces with single parameter space mappings")
     
+    input_fingerprint = Column(String, nullable=True)
+
     created_at = Column(String, nullable=True, comment="Creation timestamp")
     updated_at = Column(String, nullable=True, comment="Last update timestamp")
 
@@ -192,6 +198,9 @@ def _ensure_sqlite_column(table_name: str, column_name: str, definition_sql: str
 
 def run_lightweight_migrations():
     """Run additive, backward-compatible schema updates for SQLite."""
+    _ensure_sqlite_column("single_input_spaces", "input_fingerprint", "VARCHAR")
+    _ensure_sqlite_column("multi_input_spaces", "input_fingerprint", "VARCHAR")
+    _ensure_sqlite_column("mixed_input_spaces", "input_fingerprint", "VARCHAR")
     _ensure_sqlite_column("test_cases", "expected_status", "VARCHAR")
     _ensure_sqlite_column("test_cases", "case_type", "VARCHAR")
     _ensure_sqlite_column("test_cases", "adopted", "INTEGER DEFAULT 0")

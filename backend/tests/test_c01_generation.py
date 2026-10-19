@@ -6,8 +6,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from database import Base, Project, Api, MixedInputSpace, SingleInputSpace, TestCase, AdoptedTestCase
-from router.project import router, get_db
+from database import Base, Project, Api, MixedInputSpace, MultiInputSpace, SingleInputSpace, TestCase, AdoptedTestCase
+from router.project import router, get_db, _partition_inputs
 from services.testcase.testcase_generator import TestCaseGenerator
 
 
@@ -43,10 +43,16 @@ class EndpointTests(unittest.TestCase):
         self.engine = create_engine('sqlite://', connect_args={'check_same_thread': False}, poolclass=StaticPool)
         Base.metadata.create_all(self.engine)
         self.db = sessionmaker(bind=self.engine)()
-        self.db.add_all([Project(id=1), Api(id=1, project_id=1),
-                         MixedInputSpace(api_id=1, spaces=spaces()), SingleInputSpace(api_id=1, spaces={}),
+        self.db.add_all([Project(id=1), Api(id=1, project_id=1, swagger_doc={"summary": "C01 fixture"}),
+                         MixedInputSpace(api_id=1, spaces=spaces()), MultiInputSpace(api_id=1, spaces=spaces()),
+                         SingleInputSpace(api_id=1, spaces={"text": [{"category_name": "text", "sample_values": ["hello"]}]}),
                          TestCase(api_id=1, name='original', expected_status='201', adopted=1),
                          AdoptedTestCase(api_id=1, name='adopted')])
+        self.db.commit()
+        # C04 requires complete fingerprinted fixtures; C01 behavior assertions stay unchanged.
+        fingerprint, *_ = _partition_inputs(self.db, self.db.query(Api).one(), {})
+        for model in (SingleInputSpace, MultiInputSpace, MixedInputSpace):
+            self.db.query(model).one().input_fingerprint = fingerprint
         self.db.commit()
         app = FastAPI()
         app.include_router(router)

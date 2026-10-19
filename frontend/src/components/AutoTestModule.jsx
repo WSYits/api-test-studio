@@ -393,7 +393,9 @@ export default function AutoTestModule({ projects, apis, styles, onTaskCreated }
                 <div style={{ display: 'flex', gap: '10px' }}>
                   <button
                     onClick={() => {
-                      setSelectedConstraints([]);
+                      // 默认选择当前 API 的全部已保存约束
+                      setSelectedConstraints(apiConstraints.map(constraint => constraint.id));
+
                       setSelectedCaseTypes([]);
                       setGenerateCount(5);
                       setShowAiGenerateModal(true);
@@ -571,6 +573,10 @@ export default function AutoTestModule({ projects, apis, styles, onTaskCreated }
                             const partitionResponse = await fetch(`http://localhost:8080/projects/${selectedProject}/apis/${selectedApi.id}/generate-full-partition`, {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
+                              // 将用户选中的约束传递给后端
+                              body: JSON.stringify({
+                              selected_constraints: selectedConstraints
+                              }),
                             });
 
                             if (!partitionResponse.ok) {
@@ -607,7 +613,12 @@ export default function AutoTestModule({ projects, apis, styles, onTaskCreated }
                             const testCaseResponse = await fetch(`http://localhost:8080/projects/${selectedProject}/apis/${selectedApi.id}/generate-test-cases`, {
                               method: 'POST',
                               headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ count: generateCount, case_types: selectedCaseTypes }),
+                              body: JSON.stringify({
+                                count: generateCount,
+                                case_types: selectedCaseTypes,
+                                selected_constraints: selectedConstraints,
+                                input_fingerprint: partitionResult.input_fingerprint,
+                              }),
                             });
 
                             if (!testCaseResponse.ok) {
